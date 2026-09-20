@@ -1,0 +1,79 @@
+# Copyright 2026 Google Inc. All Rights Reserved.
+#
+# Distributed under MIT license.
+# See file LICENSE for detail or copy at https://opensource.org/licenses/MIT
+
+# Build the native CLI on the supported Ubuntu 22.04 architectures.
+
+name: Build
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    name: Build (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-22.04
+            machine: x86_64
+          - arch: arm64
+            runner: ubuntu-22.04-arm
+            machine: aarch64
+
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
+        with:
+          egress-policy: audit
+
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify runner architecture
+        run: test "$(uname -m)" = "${{ matrix.machine }}"
+
+      - name: Configure
+        run: |
+          cmake -S . -B out \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DBROTLI_BUILD_TOOLS=ON \
+            -DBROTLI_DISABLE_TESTS=ON
+
+      - name: Build
+        run: cmake --build out --parallel
+
+      - name: Prepare artifact
+        run: |
+          mkdir -p artifact
+          cp out/brotli artifact/brotli
+          chmod 755 artifact/brotli
+          test -x artifact/brotli
+          artifact/brotli -V
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: brotli-${{ matrix.arch }}
+          path: artifact/brotli
+          if-no-files-found: error
+          retention-days: 7
