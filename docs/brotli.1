@@ -100,6 +100,10 @@ bigger values cause denser, but slower compression
 .IP \[bu] 2
 \f[B]-t\f[R], \f[B]--test\f[R]: test file integrity mode
 .IP \[bu] 2
+\f[B]-T NUM\f[R], \f[B]--threads=NUM\f[R]: use NUM compression threads for
+large regular files; 0 selects the online CPU count; output remains a
+standard Brotli stream; default is serial compression
+.IP \[bu] 2
 \f[B]-v\f[R], \f[B]--verbose\f[R]: increase output verbosity
 .IP \[bu] 2
 \f[B]-w NUM\f[R], \f[B]--lgwin=NUM\f[R]: set LZ77 window size (0, 10-24)

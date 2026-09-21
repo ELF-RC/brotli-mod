@@ -131,6 +131,11 @@ cc_binary(
     name = "brotli",
     srcs = ["c/tools/brotli.c"],
     copts = STRICT_C_OPTIONS,
+    linkopts = select({
+        ":clang-cl": [],
+        ":msvc": [],
+        "//conditions:default": ["-pthread"],
+    }),
     linkstatic = 1,
     deps = [
         ":brotlidec",
