@@ -26,11 +26,11 @@
 #include "../common/version.h"
 #include <brotli/decode.h>
 #include <brotli/encode.h>
-
 #if defined(_WIN32)
 #include <io.h>
 #include <share.h>
 #include <sys/utime.h>
+#include <windows.h>
 
 #define MAKE_BINARY(FILENO) (_setmode((FILENO), _O_BINARY), (FILENO))
 
@@ -70,10 +70,21 @@ static int ms_open(const char* filename, int oflag, int pmode) {
   return result;
 }
 #else  /* !defined(_WIN32) */
+#if !defined(__EMSCRIPTEN__)
+#include <pthread.h>
+#endif
 #include <unistd.h>
 #include <utime.h>
 #define MAKE_BINARY(FILENO) (FILENO)
 #endif  /* defined(_WIN32) */
+
+#if defined(_WIN32)
+typedef HANDLE BrotliThread;
+#elif defined(__EMSCRIPTEN__)
+typedef void* BrotliThread;
+#else
+typedef pthread_t BrotliThread;
+#endif
 
 #if defined(_POSIX_C_SOURCE) && (_POSIX_C_SOURCE >= 200809L)
 #define HAVE_UTIMENSAT 1
@@ -115,13 +126,18 @@ typedef enum {
 
 #define DEFAULT_LGWIN 24
 #define DEFAULT_SUFFIX ".br"
-#define MAX_OPTIONS 24
+#define MAX_OPTIONS 32
 #define MAX_COMMENT_LEN 80
+#define MAX_THREADS 1024
+#define PARALLEL_CHUNK_SIZE (16u << 20)
+#define PARALLEL_OUTPUT_SIZE (1u << 20)
 
 typedef struct {
   /* Parameters */
   int quality;
   int lgwin;
+  int threads;
+  BROTLI_BOOL threads_set;
   int verbosity;
   BROTLI_BOOL force_overwrite;
   BROTLI_BOOL junk_source;
@@ -305,7 +321,7 @@ static Command ParseParams(Context* params) {
     size_t arg_len = arg ? strlen(arg) : 0;
 
     /* Too many options. The expected longest option list is:
-       "-q 0 -w 10 -o f -D d -S b -d -f -k -n -v -K --", i.e. 17 items in total.
+       "-q 0 -w 10 -o f -D d -S b -T 2 -d -f -k -n -v -K --", i.e. 19 items in total.
        This check is an additional guard that is never triggered, but provides
        a guard for future changes. */
     if (next_option_index > (MAX_OPTIONS - 2)) {
@@ -410,6 +426,21 @@ static Command ParseParams(Context* params) {
             return COMMAND_INVALID;
           }
           params->verbosity = 1;
+          continue;
+        } else if (c == 'T') {
+          if (j + 1 != arg_len) {
+            fprintf(stderr, "expected parameter for argument -T\n");
+            return COMMAND_INVALID;
+          }
+          i++;
+          if (i == argc || !argv[i] || argv[i][0] == 0 ||
+              params->threads_set ||
+              !ParseInt(argv[i], 0, MAX_THREADS, &params->threads)) {
+            fprintf(stderr, "error parsing threads value\n");
+            return COMMAND_INVALID;
+          }
+          params->threads_set = BROTLI_TRUE;
+          params->not_input_indices[next_option_index++] = i;
           continue;
         } else if (c == 'K') {
           if (concatenated_set) {
@@ -588,6 +619,9 @@ static Command ParseParams(Context* params) {
           return COMMAND_INVALID;
         }
         params->verbosity = 1;
+      } else if (strcmp("threads", arg) == 0) {
+        fprintf(stderr, "must pass the parameter as --threads=NUM\n");
+        return COMMAND_INVALID;
       } else if (strcmp("version", arg) == 0) {
         /* Don't parse further. */
         return COMMAND_VERSION;
@@ -671,6 +705,13 @@ static Command ParseParams(Context* params) {
             fprintf(stderr, "error parsing quality value [%s]\n", value);
             return COMMAND_INVALID;
           }
+        } else if (strncmp("threads", arg, key_len) == 0) {
+          if (params->threads_set ||
+              !ParseInt(value, 0, MAX_THREADS, &params->threads)) {
+            fprintf(stderr, "error parsing threads value [%s]\n", value);
+            return COMMAND_INVALID;
+          }
+          params->threads_set = BROTLI_TRUE;
         } else if (strncmp("suffix", arg, key_len) == 0) {
           if (suffix_set) {
             fprintf(stderr, "suffix already set\n");
@@ -742,6 +783,8 @@ static void PrintHelp(const char* name, BROTLI_BOOL error) {
 "  -q NUM, --quality=NUM       compression level (%d-%d)\n",
           BROTLI_MIN_QUALITY, BROTLI_MAX_QUALITY);
   fprintf(media,
+"  -T NUM, --threads=NUM       compression threads (0: automatic; default:serial)\n"
+"                              standard Brotli stream stitching for files\n"
 "  -t, --test                  test compressed file integrity\n"
 "  -v, --verbose               verbose mode\n");
   fprintf(media,
@@ -1148,6 +1191,326 @@ static BROTLI_BOOL FlushOutput(Context* context) {
   return BROTLI_TRUE;
 }
 
+static void PrintFileProcessingProgress(Context* context);
+
+typedef struct {
+  uint8_t* data;
+  size_t size;
+  size_t capacity;
+} ParallelOutput;
+
+typedef struct {
+  const uint8_t* input;
+  size_t input_size;
+  uint64_t stream_offset;
+  uint64_t total_size;
+  int quality;
+  int lgwin;
+  BROTLI_BOOL is_last;
+  const uint8_t* comment;
+  size_t comment_size;
+  BrotliEncoderPreparedDictionary* prepared_dictionary;
+  ParallelOutput output;
+  BROTLI_BOOL ok;
+} ParallelCompressJob;
+
+static BROTLI_BOOL ParallelOutputReserve(ParallelOutput* output,
+                                          size_t extra) {
+  size_t required;
+  size_t capacity;
+  uint8_t* data;
+  if (extra > (size_t)-1 - output->size) return BROTLI_FALSE;
+  required = output->size + extra;
+  if (required <= output->capacity) return BROTLI_TRUE;
+  capacity = output->capacity ? output->capacity : PARALLEL_OUTPUT_SIZE;
+  while (capacity < required) {
+    if (capacity > (size_t)-1 / 2) {
+      capacity = required;
+      break;
+    }
+    capacity *= 2;
+  }
+  data = (uint8_t*)realloc(output->data, capacity);
+  if (data == NULL) return BROTLI_FALSE;
+  output->data = data;
+  output->capacity = capacity;
+  return BROTLI_TRUE;
+}
+
+static BROTLI_BOOL ParallelEncodeOperation(BrotliEncoderState* state,
+    BrotliEncoderOperation operation, const uint8_t* input, size_t input_size,
+    ParallelOutput* output) {
+  const uint8_t* next_in = input;
+  size_t available_in = input_size;
+  for (;;) {
+    size_t available_out;
+    uint8_t* next_out;
+    size_t old_input = available_in;
+    size_t old_output = output->size;
+    if (!ParallelOutputReserve(output, PARALLEL_OUTPUT_SIZE)) {
+      return BROTLI_FALSE;
+    }
+    available_out = output->capacity - output->size;
+    next_out = output->data + output->size;
+    if (!BrotliEncoderCompressStream(state, operation, &available_in,
+        &next_in, &available_out, &next_out, NULL)) {
+      return BROTLI_FALSE;
+    }
+    output->size = (size_t)(next_out - output->data);
+    if (available_in == 0 &&
+        ((operation == BROTLI_OPERATION_FINISH &&
+          BrotliEncoderIsFinished(state)) ||
+         (operation != BROTLI_OPERATION_FINISH &&
+          !BrotliEncoderHasMoreOutput(state)))) {
+      return BROTLI_TRUE;
+    }
+    if (old_input == available_in && old_output == output->size &&
+        available_out != 0) {
+      return BROTLI_FALSE;
+    }
+  }
+}
+
+static BROTLI_BOOL ConfigureParallelEncoder(BrotliEncoderState* state,
+    const ParallelCompressJob* job) {
+  uint64_t size_hint = job->total_size;
+  if (size_hint > (1u << 30)) size_hint = (1u << 30);
+  if (!BrotliEncoderSetParameter(state, BROTLI_PARAM_QUALITY,
+      (uint32_t)job->quality)) return BROTLI_FALSE;
+  if (!BrotliEncoderSetParameter(state, BROTLI_PARAM_LGWIN,
+      (uint32_t)job->lgwin)) return BROTLI_FALSE;
+  if (size_hint != 0 && !BrotliEncoderSetParameter(state,
+      BROTLI_PARAM_SIZE_HINT, (uint32_t)size_hint)) return BROTLI_FALSE;
+  if (job->stream_offset != 0) {
+    uint64_t max_offset = BROTLI_MAX_BACKWARD_LIMIT(job->lgwin);
+    uint64_t stream_offset = job->stream_offset;
+    if (stream_offset > max_offset) stream_offset = max_offset;
+    if (!BrotliEncoderSetParameter(state, BROTLI_PARAM_STREAM_OFFSET,
+        (uint32_t)stream_offset)) return BROTLI_FALSE;
+  }
+  if (job->prepared_dictionary && !BrotliEncoderAttachPreparedDictionary(
+      state, job->prepared_dictionary)) return BROTLI_FALSE;
+  return BROTLI_TRUE;
+}
+
+#if defined(_WIN32)
+static DWORD WINAPI ParallelCompressWorker(LPVOID opaque) {
+#else
+static void* ParallelCompressWorker(void* opaque) {
+#endif
+  ParallelCompressJob* job = (ParallelCompressJob*)opaque;
+  BrotliEncoderState* state = BrotliEncoderCreateInstance(NULL, NULL, NULL);
+  job->ok = BROTLI_FALSE;
+  if (state != NULL && ConfigureParallelEncoder(state, job)) {
+    if ((job->comment_size == 0 || ParallelEncodeOperation(state,
+            BROTLI_OPERATION_EMIT_METADATA, job->comment, job->comment_size,
+            &job->output)) &&
+        ParallelEncodeOperation(state,
+            job->is_last ? BROTLI_OPERATION_FINISH : BROTLI_OPERATION_FLUSH,
+            job->input, job->input_size, &job->output) &&
+        (!job->is_last || BrotliEncoderIsFinished(state))) {
+      job->ok = BROTLI_TRUE;
+    }
+  }
+  if (state != NULL) BrotliEncoderDestroyInstance(state);
+#if defined(_WIN32)
+  return 0;
+#else
+  return NULL;
+#endif
+}
+
+static BROTLI_BOOL StartParallelThread(BrotliThread* thread,
+                                       ParallelCompressJob* job) {
+#if defined(_WIN32)
+  *thread = CreateThread(NULL, 0, ParallelCompressWorker, job, 0, NULL);
+  return TO_BROTLI_BOOL(*thread != NULL);
+#elif defined(__EMSCRIPTEN__)
+  (void)thread;
+  (void)job;
+  return BROTLI_FALSE;
+#else
+  return TO_BROTLI_BOOL(pthread_create(thread, NULL, ParallelCompressWorker,
+                                        job) == 0);
+#endif
+}
+
+static void JoinParallelThread(BrotliThread thread) {
+#if defined(_WIN32)
+  WaitForSingleObject(thread, INFINITE);
+  CloseHandle(thread);
+#elif !defined(__EMSCRIPTEN__)
+  pthread_join(thread, NULL);
+#else
+  (void)thread;
+#endif
+}
+
+static int AvailableProcessorCount(void) {
+#if defined(_WIN32)
+  SYSTEM_INFO info;
+  GetSystemInfo(&info);
+  return info.dwNumberOfProcessors > MAX_THREADS ? MAX_THREADS :
+      (int)(info.dwNumberOfProcessors > 0 ? info.dwNumberOfProcessors : 1);
+#elif defined(__EMSCRIPTEN__)
+  return 1;
+#else
+  long count = sysconf(_SC_NPROCESSORS_ONLN);
+  return count > 0 ? (int)(count > MAX_THREADS ? MAX_THREADS : count) : 1;
+#endif
+}
+
+static int ResolveThreadCount(int requested) {
+  int count = requested == 0 ? AvailableProcessorCount() : requested;
+  if (count < 1) count = 1;
+  if (count > MAX_THREADS) count = MAX_THREADS;
+  return count;
+}
+
+static BROTLI_BOOL ParallelThreadsSupported(void) {
+#if defined(__EMSCRIPTEN__)
+  return BROTLI_FALSE;
+#else
+  return BROTLI_TRUE;
+#endif
+}
+
+static void DestroyParallelJobs(ParallelCompressJob* jobs, size_t count) {
+  size_t i;
+  for (i = 0; i < count; ++i) {
+    free((void*)jobs[i].input);
+    free(jobs[i].output.data);
+    jobs[i].input = NULL;
+    jobs[i].output.data = NULL;
+  }
+}
+
+static BROTLI_BOOL ReadParallelInput(Context* context, uint8_t* buffer,
+                                     size_t size) {
+  size_t read_size = 0;
+  while (read_size < size) {
+    size_t result = fread(buffer + read_size, 1, size - read_size,
+                          context->fin);
+    if (result == 0) {
+      if (ferror(context->fin)) {
+        fprintf(stderr, "failed to read input [%s]: %s\n",
+                PrintablePath(context->current_input_path), strerror(errno));
+      } else {
+        fprintf(stderr, "unexpected end of input [%s]\n",
+                PrintablePath(context->current_input_path));
+      }
+      return BROTLI_FALSE;
+    }
+    read_size += result;
+  }
+  context->total_in += size;
+  return BROTLI_TRUE;
+}
+
+static BROTLI_BOOL WriteParallelOutput(Context* context,
+                                       const ParallelOutput* output) {
+  size_t written = 0;
+  while (written < output->size) {
+    size_t result = fwrite(output->data + written, 1,
+                          output->size - written, context->fout);
+    if (result == 0) {
+      fprintf(stderr, "failed to write output [%s]: %s\n",
+              PrintablePath(context->current_output_path), strerror(errno));
+      return BROTLI_FALSE;
+    }
+    written += result;
+  }
+  context->total_out += output->size;
+  return BROTLI_TRUE;
+}
+
+static BROTLI_BOOL CompressFileParallel(Context* context, int lgwin,
+                                        int thread_count) {
+  const uint64_t input_size = (uint64_t)context->input_file_length;
+  const size_t chunk_size = PARALLEL_CHUNK_SIZE;
+  ParallelCompressJob* jobs = (ParallelCompressJob*)calloc(
+      (size_t)thread_count, sizeof(*jobs));
+  BrotliThread* threads = (BrotliThread*)calloc(
+      (size_t)thread_count, sizeof(*threads));
+  uint64_t offset = 0;
+  if (jobs == NULL || threads == NULL) {
+    free(jobs);
+    free(threads);
+    fprintf(stderr, "out of memory\n");
+    return BROTLI_FALSE;
+  }
+  context->total_in = 0;
+  context->total_out = 0;
+  if (context->verbosity > 0) context->start_time = clock();
+  while (offset < input_size) {
+    size_t batch_count = 0;
+    size_t started = 0;
+    BROTLI_BOOL is_ok = BROTLI_TRUE;
+    while (batch_count < (size_t)thread_count && offset < input_size) {
+      uint64_t remaining = input_size - offset;
+      size_t current_size = (size_t)(remaining > (uint64_t)chunk_size ?
+          (uint64_t)chunk_size : remaining);
+      ParallelCompressJob* job = &jobs[batch_count];
+      memset(job, 0, sizeof(*job));
+      job->input = (const uint8_t*)malloc(current_size);
+      if (job->input == NULL || !ReadParallelInput(context,
+          (uint8_t*)job->input, current_size)) {
+        free((void*)job->input);
+        job->input = NULL;
+        is_ok = BROTLI_FALSE;
+        break;
+      }
+      job->input_size = current_size;
+      job->stream_offset = offset;
+      job->total_size = input_size;
+      job->quality = context->quality;
+      job->lgwin = lgwin;
+      job->is_last = TO_BROTLI_BOOL(offset + current_size == input_size);
+      job->comment = job->stream_offset == 0 ? context->comment : NULL;
+      job->comment_size = job->stream_offset == 0 ? context->comment_len : 0;
+      job->prepared_dictionary = context->prepared_dictionary;
+      offset += current_size;
+      batch_count++;
+    }
+    if (is_ok) {
+      for (started = 0; started < batch_count; ++started) {
+        if (!StartParallelThread(&threads[started], &jobs[started])) {
+          is_ok = BROTLI_FALSE;
+          break;
+        }
+      }
+    }
+    while (started != 0) {
+      --started;
+      JoinParallelThread(threads[started]);
+    }
+    if (is_ok) {
+      size_t i;
+      for (i = 0; i < batch_count; ++i) {
+        if (!jobs[i].ok || !WriteParallelOutput(context, &jobs[i].output)) {
+          is_ok = BROTLI_FALSE;
+          break;
+        }
+      }
+    }
+    DestroyParallelJobs(jobs, batch_count);
+    if (!is_ok) {
+      free(jobs);
+      free(threads);
+      return BROTLI_FALSE;
+    }
+  }
+  free(jobs);
+  free(threads);
+  if (context->verbosity > 0) {
+    context->end_time = clock();
+    fprintf(stderr, "Compressed ");
+    PrintFileProcessingProgress(context);
+    fprintf(stderr, "\n");
+  }
+  return BROTLI_TRUE;
+}
+
 static void PrintBytes(size_t value) {
   if (value < 1024) {
     fprintf(stderr, "%d B", (int)value);
@@ -1414,68 +1777,106 @@ static BROTLI_BOOL CompressFile(Context* context, BrotliEncoderState* s) {
   }
 }
 
+static int CompressionWindowBits(const Context* context) {
+  int lgwin;
+  if (context->lgwin > 0) return context->lgwin;
+  lgwin = DEFAULT_LGWIN;
+  if (context->input_file_length >= 0) {
+    lgwin = BROTLI_MIN_WINDOW_BITS;
+    while (BROTLI_MAX_BACKWARD_LIMIT(lgwin) <
+           (uint64_t)context->input_file_length) {
+      lgwin++;
+      if (lgwin == BROTLI_MAX_WINDOW_BITS) break;
+    }
+  }
+  return lgwin;
+}
+
+static void RejectUncompressible(Context* context,
+                                  BROTLI_BOOL* rm_output) {
+  if (context->reject_uncompressible &&
+      context->total_out >= context->total_in) {
+    *rm_output = BROTLI_TRUE;
+    if (context->verbosity > 0) {
+      fprintf(stderr, "Output is larger than input\n");
+    }
+  }
+}
+
 static BROTLI_BOOL CompressFiles(Context* context) {
   while (NextFile(context)) {
     BROTLI_BOOL is_ok = BROTLI_TRUE;
     BROTLI_BOOL rm_input = BROTLI_FALSE;
     BROTLI_BOOL rm_output = BROTLI_TRUE;
-    BrotliEncoderState* s = BrotliEncoderCreateInstance(NULL, NULL, NULL);
-    if (!s) {
-      fprintf(stderr, "out of memory\n");
-      return BROTLI_FALSE;
+    const int lgwin = CompressionWindowBits(context);
+    const int requested_threads = context->threads_set ?
+        ResolveThreadCount(context->threads) : 1;
+    const BROTLI_BOOL use_parallel = TO_BROTLI_BOOL(
+        context->threads_set && requested_threads > 1 &&
+        ParallelThreadsSupported() &&
+        context->current_input_path != NULL &&
+        context->input_file_length > (int64_t)PARALLEL_CHUNK_SIZE &&
+        lgwin <= BROTLI_MAX_WINDOW_BITS);
+
+    if (use_parallel) {
+      is_ok = OpenFiles(context);
+      if (is_ok && !context->current_output_path &&
+          !context->force_overwrite && isatty(STDOUT_FILENO)) {
+        fprintf(stderr, "Use -h help. Use -f to force output to a terminal.\n");
+        is_ok = BROTLI_FALSE;
+      }
+      if (is_ok) {
+        is_ok = CompressFileParallel(context, lgwin, requested_threads);
+      }
+      rm_output = !is_ok;
+      RejectUncompressible(context, &rm_output);
+      rm_input = !rm_output && context->junk_source;
+      if (!CloseFiles(context, rm_input, rm_output)) is_ok = BROTLI_FALSE;
+      if (!is_ok) return BROTLI_FALSE;
+      continue;
     }
-    BrotliEncoderSetParameter(s,
-        BROTLI_PARAM_QUALITY, (uint32_t)context->quality);
-    if (context->lgwin > 0) {
-      /* Specified by user. */
-      /* Do not enable "large-window" extension, if not required. */
-      if (context->lgwin > BROTLI_MAX_WINDOW_BITS) {
-        BrotliEncoderSetParameter(s, BROTLI_PARAM_LARGE_WINDOW, 1u);
+
+    {
+      BrotliEncoderState* s = BrotliEncoderCreateInstance(NULL, NULL, NULL);
+      if (!s) {
+        fprintf(stderr, "out of memory\n");
+        return BROTLI_FALSE;
       }
       BrotliEncoderSetParameter(s,
-          BROTLI_PARAM_LGWIN, (uint32_t)context->lgwin);
-    } else {
-      /* 0, or not specified by user; could be chosen by compressor. */
-      uint32_t lgwin = DEFAULT_LGWIN;
-      /* Use file size to limit lgwin. */
-      if (context->input_file_length >= 0) {
-        lgwin = BROTLI_MIN_WINDOW_BITS;
-        while (BROTLI_MAX_BACKWARD_LIMIT(lgwin) <
-               (uint64_t)context->input_file_length) {
-          lgwin++;
-          if (lgwin == BROTLI_MAX_WINDOW_BITS) break;
+          BROTLI_PARAM_QUALITY, (uint32_t)context->quality);
+      if (context->lgwin > 0) {
+        /* Specified by user. */
+        /* Do not enable "large-window" extension, if not required. */
+        if (context->lgwin > BROTLI_MAX_WINDOW_BITS) {
+          BrotliEncoderSetParameter(s, BROTLI_PARAM_LARGE_WINDOW, 1u);
         }
+        BrotliEncoderSetParameter(s,
+            BROTLI_PARAM_LGWIN, (uint32_t)context->lgwin);
+      } else {
+        BrotliEncoderSetParameter(s, BROTLI_PARAM_LGWIN, (uint32_t)lgwin);
       }
-      BrotliEncoderSetParameter(s, BROTLI_PARAM_LGWIN, lgwin);
-    }
-    if (context->input_file_length > 0) {
-      uint32_t size_hint = context->input_file_length < (1 << 30) ?
-          (uint32_t)context->input_file_length : (1u << 30);
-      BrotliEncoderSetParameter(s, BROTLI_PARAM_SIZE_HINT, size_hint);
-    }
-    if (context->dictionary) {
-      BrotliEncoderAttachPreparedDictionary(s, context->prepared_dictionary);
-    }
-    is_ok = OpenFiles(context);
-    if (is_ok && !context->current_output_path &&
-        !context->force_overwrite && isatty(STDOUT_FILENO)) {
-      fprintf(stderr, "Use -h help. Use -f to force output to a terminal.\n");
-      is_ok = BROTLI_FALSE;
-    }
-    if (is_ok) is_ok = CompressFile(context, s);
-    BrotliEncoderDestroyInstance(s);
-    rm_output = !is_ok;
-    if (is_ok && context->reject_uncompressible) {
-      if (context->total_out >= context->total_in) {
-        rm_output = BROTLI_TRUE;
-        if (context->verbosity > 0) {
-          fprintf(stderr, "Output is larger than input\n");
-        }
+      if (context->input_file_length > 0) {
+        uint32_t size_hint = context->input_file_length < (1 << 30) ?
+            (uint32_t)context->input_file_length : (1u << 30);
+        BrotliEncoderSetParameter(s, BROTLI_PARAM_SIZE_HINT, size_hint);
       }
+      if (context->dictionary) {
+        BrotliEncoderAttachPreparedDictionary(s, context->prepared_dictionary);
+      }
+      is_ok = OpenFiles(context);
+      if (is_ok && !context->current_output_path &&
+          !context->force_overwrite && isatty(STDOUT_FILENO)) {
+        fprintf(stderr, "Use -h help. Use -f to force output to a terminal.\n");
+        is_ok = BROTLI_FALSE;
+      }
+      if (is_ok) is_ok = CompressFile(context, s);
+      BrotliEncoderDestroyInstance(s);
+      rm_output = !is_ok;
+      RejectUncompressible(context, &rm_output);
+      rm_input = !rm_output && context->junk_source;
+      if (!CloseFiles(context, rm_input, rm_output)) is_ok = BROTLI_FALSE;
+      if (!is_ok) return BROTLI_FALSE;
     }
-    rm_input = !rm_output && context->junk_source;
-    if (!CloseFiles(context, rm_input, rm_output)) is_ok = BROTLI_FALSE;
-    if (!is_ok) return BROTLI_FALSE;
   }
   return BROTLI_TRUE;
 }
@@ -1488,6 +1889,8 @@ int main(int argc, char** argv) {
 
   context.quality = 11;
   context.lgwin = -1;
+  context.threads = 0;
+  context.threads_set = BROTLI_FALSE;
   context.verbosity = 0;
   context.comment_len = 0;
   context.force_overwrite = BROTLI_FALSE;
