@@ -1,14 +1,14 @@
 # Brotli MOD
 
-English | [中文](README_zh.md)
+[English](README.md) | 中文
 
-Original project: https://github.com/google/brotli
+原项目：https://github.com/google/brotli
 
-## Command tree
+## 命令树
 
 ```
 brotli
-├── compress                     压缩（默认行为）
+├── 压缩（默认行为）
 │   ├── -# / -q N                压缩级别（-# 等价 -q #，0-9；-q 0-11）
 │   ├── -w N / --lgwin=N         LZ77 窗口大小，2^N - 16（0 自动；10-24）
 │   ├── --large_window=N         不兼容大窗口位流（0, 10-30），非 RFC 7932
@@ -28,32 +28,32 @@ brotli
 └── -V / --version               显示版本
 ```
 
-## What the release contains
+## 产物内容
 
-The build workflow compiles a single native binary on each architecture (amd64 + arm64) and ships it as one artifact:
+构建工作流在每个架构（amd64 + arm64）上编译单个原生二进制，以单一 artifact 发布：
 
+```text
+brotli   # CMake 构建的原生 CLI：编码器 + 解码器 + 完整性测试
 ```
-brotli   # CMake-built native CLI: encoder + decoder + integrity test
-```
 
-No runtime dependencies beyond the system C library; POSIX links `pthread`, Windows uses `CreateThread`, Emscripten builds have the parallel path compiled out.
+除系统 C 库外无运行依赖；POSIX 链接 `pthread`，Windows 使用 `CreateThread`，Emscripten 构建在编译期禁用并行路径。
 
-## How it differs from upstream
+## 与上游的区别
 
-- **`-T N` / `--threads N`** — multi-threaded compression for large regular files (>16 MiB). Output is a single standard Brotli stream, decodable by any existing decoder. `-T 0` picks the core count automatically; files ≤16 MiB or `N=1` fall back to the serial path, so existing scripts are unchanged.
-- All other flags, defaults, and behaviour match upstream `brotli 1.2.0`.
+- **`-T N` / `--threads N`** — 大常规文件（>16 MiB）的多线程压缩。输出为单个标准 Brotli 流，可被任意现有解码器直接解码。`-T 0` 自动取核数；≤16 MiB 文件或 `N=1` 时回落到原串行路径，现有脚本行为不变。
+- 其余参数、默认值和行为与上游 `brotli 1.2.0` 一致。
 
-## Build
+## 构建
 
-CMake + GitHub Actions only; no Python packaging, Bazel publish, or research tooling.
+仅 CMake + GitHub Actions；无 Python 打包、Bazel 发布、研究工具链。
 
 ```sh
 cmake -S . -B out -DCMAKE_BUILD_TYPE=Release -DBROTLI_BUILD_TOOLS=ON -DBROTLI_DISABLE_TESTS=ON
 cmake --build out --parallel
 ```
 
-CI triggers on push to `master` and `edge`, plus PRs and manual dispatch.
+CI 在 `master` 和 `edge` 分支 push、PR 及手动触发上运行。
 
-## License
+## 许可证
 
-MIT. See `LICENSE`.
+MIT，见 `LICENSE`。
